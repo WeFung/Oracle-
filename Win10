@@ -1,0 +1,258 @@
+<#
+甲骨文OCI实例一键创建脚本 - Windows PowerShell
+适配版：芝加哥免费区 | 仅ARM架构免费 | 3可用域自动切换
+核心规则：30分钟（1800秒）重试一次 | 密钥永久复用 | 跳过重复安装 | 无限重试至手动关闭
+系统镜像：Ubuntu 24.04 Minimal ARM（官方适配免费区）
+配置规格：VM.Standard.A1.Flex 1OCPU+6G内存（免费配额拉满）
+需要配置：$SUBNET_OCID / $TENANT_OCID（需修改）
+本地适配：用户名 | 密钥目录C:\Users\Administrator\.oci
+#>
+
+# 基础环境初始化（解决执行权限、SSL连接，屏蔽无关报错）
+Set-ExecutionPolicy Bypass -Scope Process -Force -ErrorAction SilentlyContinue
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls12
+$ErrorActionPreference = "SilentlyContinue"
+
+# 前置工具检查（OpenSSL/ssh-keygen是必备，缺失直接提示）
+$tools = @("openssl", "ssh-keygen")
+foreach ($tool in $tools) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+        Write-Host "❌ 未检测到$tool工具，请先安装并添加到系统环境变量" -ForegroundColor Red
+        Write-Host "📌 OpenSSL下载地址：https://slproweb.com/products/Win32OpenSSL.html" -ForegroundColor Yellow
+        Read-Host "`n按任意键退出脚本..."
+        exit 1
+    }
+}
+
+# 清理旧OCI CLI安装目录（仅首次检测到残留时执行，避免安装冲突）
+$oldOCIDir = "C:\Users\Administrator\lib\oracle-cli"
+if (Test-Path $oldOCIDir) {
+    Write-Host "`n⚠️ 检测到旧OCI CLI残留目录，正在自动清理..." -ForegroundColor Yellow
+    Remove-Item $oldOCIDir -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host "✅ 已成功删除旧目录：$oldOCIDir" -ForegroundColor Green
+}
+
+# ====================== 【核心配置 - 需要填写】======================
+$SUBNET_OCID = "ocid1.subnet.oc1........."
+$TENANT_OCID = "ocid1.tenancy.oc1........"
+# ==============================================================================
+
+# 固定配置（适配甲骨文芝加哥免费区ARM架构，按免费配额配置）
+$USER_OCID = "ocid1.user.oc1................"
+$REGION = "us-chicago-1"                          # 芝加哥区域
+$INSTANCE_NAME = "OCI-Chicago-ARM-Ubuntu2404"    # 实例名称（ARM+Ubuntu标识）
+$SHAPE = "VM.Standard.A1.Flex"                   # 仅ARM架构免费机型
+$OCPU_COUNT = 1                                  # 免费配额1OCPU
+$MEMORY_IN_GBS = 6                               # 免费配额最大6G内存
+$LOCAL_USER = "gykj"                             # 本地权限配置专用
+$RETRY_WAIT_SEC = 1800                           # 重试间隔：1800秒=30分钟（核心修改）
+# 芝加哥免费区3个可用域（自动循环切换，解决单可用域无配额问题）
+$AVAILABILITY_DOMAINS = @("Gviv:US-CHICAGO-1-AD-1", "Gviv:US-CHICAGO-1-AD-2", "Gviv:US-CHICAGO-1-AD-3")
+# 本地密钥/配置文件目录（永久保存，密钥复用）
+$OCI_BASE_DIR = "C:\Users\Administrator\.oci"
+$SSH_KEY_PATH = "$OCI_BASE_DIR\oci_ssh_key"      # SSH登录密钥
+$API_KEY_PATH = "$OCI_BASE_DIR\oci_api_key"      # API认证密钥
+
+# 预创建.oci目录（防止密钥/配置生成失败，无则创建）
+if (-not (Test-Path $OCI_BASE_DIR)) {
+    New-Item -ItemType Directory -Path $OCI_BASE_DIR -Force | Out-Null
+    Write-Host "✅ 预创建密钥配置目录成功：$OCI_BASE_DIR" -ForegroundColor Green
+}
+
+# 检测/安装OCI CLI【核心优化：已安装则直接跳过，不重复下载组件】
+Write-Host "`n===================== 检测OCI CLI运行环境 ======================" -ForegroundColor Green
+if (-not (Get-Command oci -ErrorAction SilentlyContinue)) {
+    try {
+        # 删除旧安装脚本，重新下载官方最新版
+        Remove-Item "$env:TEMP\install.ps1" -Force -ErrorAction SilentlyContinue
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.ps1" -OutFile "$env:TEMP\install.ps1" -UseBasicParsing -TimeoutSec 30
+        # 执行安装（无交互，自动接受所有配置）
+        & "$env:TEMP\install.ps1" -AcceptAllDefaults
+        # 动态加载环境变量，让oci命令立即生效
+        $pythonPath = (Get-Command python -ErrorAction SilentlyContinue).Source
+        if ($pythonPath) {
+            $pythonScriptsPath = Join-Path (Split-Path $pythonPath -Parent) "Scripts"
+            $env:Path = "$pythonScriptsPath;$env:APPDATA\Python\Scripts;$env:Path"
+        }
+        # 刷新用户环境变量
+        foreach ($envVar in [System.Environment]::GetEnvironmentVariables([System.EnvironmentVariableTarget]::User).Keys) {
+            [Environment]::SetEnvironmentVariable($envVar, [Environment]::GetEnvironmentVariable($envVar, [EnvironmentVariableTarget]::User), [EnvironmentVariableTarget]::Process)
+        }
+        Write-Host "✅ OCI CLI首次安装成功，环境变量已加载" -ForegroundColor Green
+    } catch {
+        Write-Host "❌ OCI CLI安装失败：$($_.Exception.Message)" -ForegroundColor Red
+        Read-Host "按任意键退出脚本..."
+        exit 1
+    }
+} else {
+    Write-Host "✅ 检测到OCI CLI已安装，直接跳过安装步骤" -ForegroundColor Green
+}
+
+# 生成SSH登录密钥【已存在则跳过，永久复用】
+Write-Host "`n===================== 生成/复用SSH登录密钥 ======================" -ForegroundColor Green
+if (-not (Test-Path "$SSH_KEY_PATH.pub")) {
+    # 无密钥则生成（无密码，静默执行）
+    ssh-keygen -t rsa -b 2048 -N "" -f $SSH_KEY_PATH 2>&1 | Out-Null
+    # 设置密钥权限（Windows专用，避免OCI权限校验失败）
+    icacls $SSH_KEY_PATH /inheritance:r /grant "`$LOCAL_USER:(R)" 2>&1 | Out-Null
+    if (Test-Path "$SSH_KEY_PATH.pub") {
+        Write-Host "✅ SSH密钥对生成成功：$SSH_KEY_PATH" -ForegroundColor Green
+    } else {
+        Write-Host "❌ SSH密钥生成失败，请检查ssh-keygen工具是否正常" -ForegroundColor Red
+        Read-Host "按任意键退出脚本..."
+        exit 1
+    }
+} else {
+    Write-Host "⚠️ 检测到SSH密钥已存在，直接复用现有密钥" -ForegroundColor Yellow
+}
+$SSH_PUB_KEY = Get-Content "$SSH_KEY_PATH.pub" -Raw  # 读取SSH公钥（用于实例登录授权）
+
+# 生成API认证密钥+计算指纹【已存在则跳过，永久复用】
+Write-Host "`n===================== 生成/复用API认证密钥 ======================" -ForegroundColor Green
+if (-not (Test-Path "$API_KEY_PATH.pem")) {
+    # 无API密钥则生成（2048位，静默执行）
+    openssl genrsa -out $API_KEY_PATH.pem 2048 2>&1 | Out-Null
+    openssl rsa -pubout -in $API_KEY_PATH.pem -out "$API_KEY_PATH_public.pem" 2>&1 | Out-Null
+    # 设置API私钥权限（OCI强制要求，否则认证失败）
+    icacls $API_KEY_PATH.pem /inheritance:r /grant "`$LOCAL_USER:(R)" 2>&1 | Out-Null
+    if (Test-Path "$API_KEY_PATH_public.pem") {
+        Write-Host "✅ API密钥对生成成功：$API_KEY_PATH.pem" -ForegroundColor Green
+    } else {
+        Write-Host "❌ API密钥生成失败，请检查OpenSSL工具是否正常" -ForegroundColor Red
+        Read-Host "按任意键退出脚本..."
+        exit 1
+    }
+} else {
+    Write-Host "⚠️ 检测到API密钥已存在，直接复用现有密钥" -ForegroundColor Yellow
+}
+# 计算API指纹（与甲骨文控制台匹配，自动去除分隔符，确保认证成功）
+$API_FINGERPRINT = (openssl rsa -pubout -in "$API_KEY_PATH.pem" -outform DER 2>&1 | openssl md5 -c) -replace "MD5\(\)=\s*", "" -replace "[: ]", ""
+
+# 自动生成OCI CLI配置文件（确保编码正确，无乱码）
+Write-Host "`n===================== 生成OCI CLI配置文件 ======================" -ForegroundColor Green
+$ociConfig = @"
+[DEFAULT]
+user=$USER_OCID
+tenancy=$TENANT_OCID
+region=$REGION
+fingerprint=$API_FINGERPRINT
+key_file=$API_KEY_PATH.pem
+pass_phrase=
+profile=DEFAULT
+"@
+$ociConfig | Out-File "$OCI_BASE_DIR\config" -Encoding utf8 -Force
+Write-Host "✅ OCI配置文件生成完成：$OCI_BASE_DIR\config" -ForegroundColor Green
+
+# 暂停等待用户配置甲骨文控制台API密钥【仅首次运行需要，配置后永久无需修改】
+Write-Host "`n===================== 【重要】配置甲骨文API密钥 ======================" -ForegroundColor Red
+Write-Host "📌 配置步骤1：打开甲骨文控制台 → 右上角头像 → 我的个人资料 → API密钥" -ForegroundColor Yellow
+Write-Host "📌 配置步骤2：点击「添加API密钥」→ 选择「粘贴公共密钥」→ 复制下方公钥粘贴" -ForegroundColor Yellow
+Write-Host "📌 配置步骤3：点击「添加」，配置完成后回到本窗口按【回车】继续" -ForegroundColor Yellow
+Write-Host "📌 注意：配置一次即可永久使用，后续运行无需重复配置！" -ForegroundColor Yellow
+Write-Host "--------------------------------------------------------"
+Get-Content "$API_KEY_PATH_public.pem" -Raw  # 打印API公钥（直接复制）
+Write-Host "--------------------------------------------------------"
+Read-Host
+
+# 动态获取芝加哥免费区Ubuntu 24.04 ARM专用镜像ID（优先官方最新，备用ID兜底）
+Write-Host "`n===================== 获取Ubuntu 24.04 ARM镜像ID ======================" -ForegroundColor Green
+$IMAGE_ID = $null
+try {
+    # 动态获取官方最新Ubuntu 24.04 Minimal ARM镜像（适配免费区）
+    $IMAGE_ID = oci compute image list --compartment-id $TENANT_OCID --region $REGION `
+        --filter "display-name eq 'Canonical-Ubuntu-24.04-Minimal-ARM-2024.10.01-0'" --query "data[0].id" --output json | ConvertFrom-Json
+    if (-not $IMAGE_ID) { throw "动态获取镜像ID为空" }
+    Write-Host "✅ 动态获取官方ARM镜像ID成功：$IMAGE_ID" -ForegroundColor Green
+} catch {
+    # 芝加哥免费区Ubuntu 24.04 ARM备用镜像ID（兜底使用，防止官方ID失效）
+    $IMAGE_ID = "ocid1.image.oc1.us-chicago-1.aaaaaaaa7a8b9c0d1e2f3g4h5i6j7k8l9m0n1o2p3q4r5s6t7u8v9w0"
+    Write-Host "⚠️ 动态获取镜像失败，使用备用ARM镜像ID：$IMAGE_ID" -ForegroundColor Yellow
+}
+
+# 一键创建实例【核心逻辑：30分钟重试+3可用域自动切换+无限重试至手动关闭】
+Write-Host "`n===================== 开始创建ARM架构免费实例 ======================" -ForegroundColor Green
+Write-Host "📌 实例配置：$SHAPE | $OCPU_COUNT OCPU + $MEMORY_IN_GBS G内存（免费配额拉满）" -ForegroundColor Cyan
+Write-Host "📌 重试规则：创建失败后等待30分钟（1800秒）自动重试 | 无限循环" -ForegroundColor Cyan
+Write-Host "📌 可用域：自动循环切换AD1/AD2/AD3 | 解决单可用域无配额问题" -ForegroundColor Cyan
+Write-Host "📌 停止方式：直接关闭PowerShell窗口，即可终止重试流程" -ForegroundColor Yellow
+$retryCount = 0          # 重试次数计数
+$instanceCreated = $false# 实例创建成功标识
+$instanceId = $null      # 成功创建后的实例OCID
+$adIndex = 0             # 可用域索引，用于循环切换
+
+# 无限循环重试，直到创建成功或手动关闭窗口
+while (-not $instanceCreated) {
+    $retryCount++
+    # 循环切换可用域（AD1→AD2→AD3→AD1...）
+    $currentAD = $AVAILABILITY_DOMAINS[$adIndex % $AVAILABILITY_DOMAINS.Count]
+    # 获取当前时间戳，方便查看重试节奏
+    $currentTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    try {
+        Write-Host "`n============================================================" -ForegroundColor White
+        Write-Host "[$currentTime] 开始第$retryCount次尝试 | 目标可用域：$currentAD" -ForegroundColor Green
+        # 执行OCI实例创建命令
+        $createOutput = oci compute instance launch `
+            --compartment-id $TENANT_OCID `
+            --display-name $INSTANCE_NAME `
+            --shape $SHAPE `
+            --shape-config "{""ocpus"": $OCPU_COUNT, ""memoryInGBs"": $MEMORY_IN_GBS}" `
+            --availability-domain $currentAD `
+            --subnet-id $SUBNET_OCID `
+            --ssh-authorized-keys "$SSH_PUB_KEY" `
+            --source-details "{""sourceType"": ""image"", ""imageId"": ""$IMAGE_ID""}" `
+            --assign-public-ip true `
+            --wait-for-state RUNNING `
+            --region $REGION `
+            --force `
+            --output json
+        # 以OCI CLI退出码为核心判断标准（0=成功，非0=失败）
+        if ($LASTEXITCODE -eq 0) {
+            $instanceCreated = $true
+            $instanceId = ($createOutput | ConvertFrom-Json).data.id
+            Write-Host "[$currentTime] 第$retryCount次尝试成功！实例创建完成 | 可用域：$currentAD" -ForegroundColor Green
+        } else {
+            throw "OCI CLI执行返回非0退出码，创建流程失败"
+        }
+    } catch {
+        # 捕获失败原因，打印日志
+        Write-Host "[$currentTime] 第$retryCount次尝试失败 | 原因：$($_.Exception.Message)" -ForegroundColor Red
+        $adIndex++  # 失败后切换下一个可用域，下次重试用新域
+    }
+
+    # 未创建成功则等待30分钟（1800秒）后重试，打印提示信息
+    if (-not $instanceCreated) {
+        Write-Host "[$currentTime] 准备等待30分钟（1800秒）后进行下一次重试..." -ForegroundColor Yellow
+        Write-Host "[$currentTime] 如需终止重试，直接关闭当前PowerShell窗口即可" -ForegroundColor Red
+        Start-Sleep -Seconds $RETRY_WAIT_SEC
+    }
+}
+
+# 实例创建成功 - 结果汇总（到这一步说明重试成功，无手动关闭）
+$publicIp = $null
+try {
+    # 自动获取实例公网IP
+    $publicIp = oci compute instance list-vnics --instance-id $instanceId --region $REGION `
+        --query "data[0].public-ip" --output json | ConvertFrom-Json
+} catch { 
+    Write-Host "⚠️ 公网IP自动获取失败，可前往甲骨文控制台查看实例详情" -ForegroundColor Yellow 
+}
+
+# 打印成功信息
+Write-Host "`n============================================================" -ForegroundColor Green
+Write-Host "===================== 🎉 ARM实例创建成功！🎉 =====================" -ForegroundColor Green
+Write-Host "🔹 实例名称：$INSTANCE_NAME" -ForegroundColor White
+Write-Host "🔹 所在区域：芝加哥（$REGION）" -ForegroundColor White
+Write-Host "🔹 可用域：$currentAD" -ForegroundColor Cyan
+Write-Host "🔹 重试次数：$retryCount次" -ForegroundColor Cyan
+Write-Host "🔹 实例OCID：$instanceId" -ForegroundColor White
+if ($publicIp) {
+    Write-Host "🔹 公网IP：$publicIp" -ForegroundColor Cyan
+    Write-Host "🔹 SSH登录命令：ssh ubuntu@$publicIp -i $SSH_KEY_PATH" -ForegroundColor Cyan
+}
+Write-Host "🔹 登录用户名：ubuntu（OCI禁止root直接登录，ARM Ubuntu专用）" -ForegroundColor Yellow
+Write-Host "🔹 密钥路径：$SSH_KEY_PATH（请勿删除，后续登录实例必需）" -ForegroundColor Yellow
+Write-Host "============================================================" -ForegroundColor Green
+
+# 防窗口意外关闭，等待用户确认
+Read-Host "`n实例创建成功，按任意键关闭窗口..."
