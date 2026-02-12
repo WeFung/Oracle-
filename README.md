@@ -15,6 +15,6 @@
 
 以上的信息要在脚本的命令里填写
 
-![immwrt界面](https://github.com/user-attachments/assets/c196f381-65d0-45cd-b5d5-0cd3caf6696d）
+![immwrt界面](https://github.com/user-attachments/assets/c196f381-65d0-45cd-b5d5-0cd3caf6696d)
 
-![immwrt界面](https://github.com/user-attachments/assets/31e2d177-2f49-4428-9425-0ad185c81859）
+![immwrt界面](https://github.com/user-attachments/assets/31e2d177-2f49-4428-9425-0ad185c81859)
