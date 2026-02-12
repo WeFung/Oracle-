@@ -1,0 +1,243 @@
+<#
+  甲骨文免费ARM实例创建脚本（Win11 最终版）
+  填入你的OCID/指纹/区域信息，直接运行即可
+#>
+# ========== 已填好你的甲骨文信息 ==========
+$TENANCY_ID = "ocid1.tenancy.oc1..**************"
+$USER_ID = "ocid1.user.oc1..************"
+$COMPARTMENT_ID = "ocid1.tenancy.oc1..*****************" # Compartment默认和租户ID一致
+$API_FINGERPRINT = "****************************"
+# =================================================
+
+# 固定配置
+$REGION = "us-chicago-1" #你的主区域
+$AVAILABILITY_DOMAINS = @("Gviv:US-CHICAGO-1-AD-2", "Gviv:US-CHICAGO-1-AD-3", "Gviv:US-CHICAGO-1-AD-1")
+$SSH_KEY_PATH = "C:\Users\$env:USERNAME\.oci\oci_ssh_key"
+$SSH_PUB_KEY_PATH = "C:\Users\$env:USERNAME\.oci\oci_ssh_key.pub"
+$PRIVATE_KEY_FILE = "C:\Users\$env:USERNAME\.oci\oci_api_key.pem" # 你的API私钥文件路径
+$RETRY_WAIT_SECONDS = 1800  # 30分钟
+$INSTANCE_SHAPE = "VM.Standard.A1.Flex"
+$INSTANCE_CONFIG = '{"ocpus":4,"memoryInGBs":24}'
+
+# ===================== 0. 自动检测并配置 OCI CLI 路径 =====================
+Write-Host "`n===================== 检测 OCI CLI 环境 ======================" -ForegroundColor Green
+$ociPaths = @(
+    "C:\Users\Lenovo\bin",
+    "C:\Program Files\Oracle\OCI CLI\bin",
+    "C:\Users\$env:USERNAME\AppData\Local\Oracle\OCI CLI\bin"
+)
+
+foreach ($path in $ociPaths) {
+    if (Test-Path (Join-Path $path "oci.exe")) {
+        $env:PATH = "$path;$env:PATH"
+        Write-Host "✅ 自动检测到 OCI CLI：$path" -ForegroundColor Green
+        break
+    }
+}
+
+if (-not (Get-Command "oci" -ErrorAction SilentlyContinue)) {
+    Write-Host "❌ 未检测到 OCI CLI，请先安装！" -ForegroundColor Red
+    Read-Host "按任意键退出..."
+    exit 1
+}
+
+# ===================== 1. 自动生成SSH密钥 + 强制显示公钥 =====================
+Write-Host "`n===================== SSH密钥检查/生成 ======================" -ForegroundColor Green
+New-Item -ItemType Directory -Path "C:\Users\$env:USERNAME\.oci" -Force | Out-Null
+
+if (-not (Test-Path $SSH_KEY_PATH) -or -not (Test-Path $SSH_PUB_KEY_PATH)) {
+    Write-Host "⚠️  未检测到SSH密钥，自动生成中..." -ForegroundColor Yellow
+    ssh-keygen -t rsa -b 2048 -N "" -f $SSH_KEY_PATH 2>&1 | Out-Null
+    if (Test-Path $SSH_KEY_PATH -and Test-Path $SSH_PUB_KEY_PATH) {
+        Write-Host "✅ SSH密钥自动生成成功！" -ForegroundColor Green
+    } else {
+        Write-Host "❌ SSH密钥生成失败，请手动执行：ssh-keygen -t rsa -b 2048 -N "" -f $SSH_KEY_PATH" -ForegroundColor Red
+        Read-Host "按任意键退出..."
+        exit 1
+    }
+} else {
+    Write-Host "✅ SSH密钥已存在" -ForegroundColor Green
+}
+
+# 强制显示公钥并等待确认
+Write-Host "`n===================== 复制SSH公钥到甲骨文控制台 ======================" -ForegroundColor Cyan
+Write-Host "📋 你的SSH公钥内容如下（请完整复制）：" -ForegroundColor White
+Get-Content $SSH_PUB_KEY_PATH
+Write-Host "`n💡 操作步骤：" -ForegroundColor Yellow
+Write-Host "1. 复制上面的公钥（从 ssh-rsa 开头到结尾）"
+Write-Host "2. 登录甲骨文控制台 → 计算 → 实例 → 创建实例 → 粘贴公共密钥"
+Write-Host "3. 配置完成后，回到这里按任意键继续..." -ForegroundColor Yellow
+Read-Host "按任意键继续..."
+
+# ===================== 2. Win11 OpenSSL环境配置 =====================
+Write-Host "`n===================== Win11工具环境检测 ======================" -ForegroundColor Green
+$opensslPaths = @(
+    "C:\Program Files\OpenSSL-Win64\bin",
+    "C:\Program Files (x86)\OpenSSL-Win32\bin",
+    "C:\OpenSSL-win64\bin",
+    "C:\Users\Lenovo\AppData\Local\Programs\OpenSSL\bin"
+)
+$sshPaths = @("C:\Windows\System32\OpenSSH")
+foreach ($path in $opensslPaths + $sshPaths) {
+    if (Test-Path $path -PathType Container) {
+        $env:PATH = "$path;$env:PATH"
+        Write-Host "✅ 自动添加环境变量：$path" -ForegroundColor Green
+    }
+}
+$tools = @("openssl", "ssh-keygen") | Where-Object { $_ -ne "" }
+foreach ($tool in $tools) {
+    if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+        Write-Host "❌ 未检测到 $tool 工具，请先安装！" -ForegroundColor Red
+        Read-Host "按任意键退出..."
+        exit 1
+    }
+}
+Write-Host "✅ Win11工具环境检查通过" -ForegroundColor Green
+
+# ===================== 3. 管理员权限检查 =====================
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "❌ 请以【管理员身份】运行Windows PowerShell！" -ForegroundColor Red
+    Read-Host "按任意键退出..."
+    exit 1
+}
+
+# ===================== 4. API密钥检查 =====================
+Write-Host "`n===================== API密钥检查 ======================" -ForegroundColor Green
+if (-not (Test-Path $PRIVATE_KEY_FILE)) {
+    Write-Host "❌ API私钥文件缺失：$PRIVATE_KEY_FILE" -ForegroundColor Red
+    Write-Host "💡 请将你的oci_api_key.pem复制到 C:\Users\$env:USERNAME\.oci\ 目录下" -ForegroundColor Yellow
+    Read-Host "按任意键退出..."
+    exit 1
+}
+Write-Host "✅ API密钥检查通过" -ForegroundColor Green
+
+# ===================== 5. 精准倒计时函数 =====================
+function Show-PreciseCountdown {
+    param(
+        [int]$TotalSeconds,
+        [string]$NextRetryTime
+    )
+    $endTime = (Get-Date).AddSeconds($TotalSeconds)
+    while ((Get-Date) -lt $endTime) {
+        $remaining = $endTime - (Get-Date)
+        $minutes = [math]::Floor($remaining.TotalMinutes)
+        $seconds = $remaining.Seconds
+        Write-Host "`r⏳ 下一轮重试时间：$NextRetryTime | 剩余：$minutes 分 $seconds 秒 " -NoNewline -ForegroundColor Cyan
+        Start-Sleep -Seconds 1
+    }
+    Write-Host "`r                                                                                " -NoNewline
+    Write-Host "`n✅ 倒计时结束，开始下一轮重试！`n" -ForegroundColor Green
+}
+
+# ===================== 6. OCI环境配置（抑制警告） =====================
+Write-Host "`n===================== 配置OCI环境 ======================" -ForegroundColor Green
+$env:OCI_CLI_AUTH = "api_key"
+$env:OCI_TENANCY_ID = $TENANCY_ID
+$env:OCI_USER_ID = $USER_ID
+$env:OCI_FINGERPRINT = $API_FINGERPRINT
+$env:OCI_PRIVATE_KEY_FILE = $PRIVATE_KEY_FILE
+$env:OCI_REGION = $REGION
+$env:OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING = "True"
+Write-Host "✅ OCI环境配置完成" -ForegroundColor Green
+
+# ===================== 7. 核心自动重试逻辑（完整遍历3个AD） =====================
+Write-Host "`n===================== 开始自动创建实例 ======================" -ForegroundColor Green
+$success = $false
+$retryRound = 0
+
+while (-not $success) {
+    $retryRound++
+    $allADFailed = $true
+    $currentRoundTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $nextRetryTime = (Get-Date).AddSeconds($RETRY_WAIT_SECONDS).ToString("yyyy-MM-dd HH:mm:ss")
+
+    Write-Host "`n=====================================================" -ForegroundColor Cyan
+    Write-Host "🔄 第 $retryRound 轮重试 | 开始时间：$currentRoundTime" -ForegroundColor Cyan
+    Write-Host "=====================================================" -ForegroundColor Cyan
+
+    # 完整遍历3个AD：AD-2 → AD-3 → AD-1
+    foreach ($AD in $AVAILABILITY_DOMAINS) {
+        Write-Host "`n📌 尝试可用域：$AD" -ForegroundColor White
+        try {
+            # 1. 获取Ubuntu 22.04镜像ID
+            $imageId = oci compute image list `
+                --compartment-id $COMPARTMENT_ID `
+                --operating-system "Ubuntu" `
+                --operating-system-version "22.04" `
+                --query 'data[0].id' `
+                --raw-output 2>&1
+            
+            if (-not $imageId -or $LASTEXITCODE -ne 0) {
+                Write-Host "⚠️  未找到Ubuntu 22.04镜像，跳过该可用域" -ForegroundColor Yellow
+                continue
+            }
+
+            # 2. 获取子网ID
+            $subnetId = oci network subnet list `
+                --compartment-id $COMPARTMENT_ID `
+                --query 'data[0].id' `
+                --raw-output 2>&1
+            
+            if (-not $subnetId -or $LASTEXITCODE -ne 0) {
+                Write-Host "⚠️  未找到子网，跳过该可用域" -ForegroundColor Yellow
+                continue
+            }
+
+            # 3. 创建实例
+            $instanceId = oci compute instance launch `
+                --availability-domain $AD `
+                --compartment-id $COMPARTMENT_ID `
+                --shape $INSTANCE_SHAPE `
+                --shape-config $INSTANCE_CONFIG `
+                --image-id $imageId `
+                --subnet-id $subnetId `
+                --ssh-authorized-keys-file $SSH_PUB_KEY_PATH `
+                --display-name "FreeARM_Instance" `
+                --wait-for-state RUNNING `
+                --query 'data.id' `
+                --raw-output 2>&1
+
+            if ($instanceId -and $LASTEXITCODE -eq 0) {
+                $publicIp = oci compute instance list-vnics `
+                    --instance-id $instanceId `
+                    --query 'data[0]."public-ip"' `
+                    --raw-output 2>&1
+                
+                Write-Host "`n🎉 第$retryRound轮创建成功！" -ForegroundColor Green
+                Write-Host "🔑 实例ID：$instanceId" -ForegroundColor White
+                Write-Host "🌐 公网IP：$publicIp" -ForegroundColor Cyan
+                Write-Host "📌 登录命令：ssh ubuntu@$publicIp -i $SSH_KEY_PATH" -ForegroundColor Cyan
+                $success = $true
+                $allADFailed = $false
+                break
+            }
+        }
+        catch {
+            $errorMsg = $_.Exception.Message
+            if ($errorMsg -match "Out of host capacity" -or $errorMsg -match "Quota exceeded") {
+                Write-Host "⚠️  可用域$AD：无资源（容量已满）" -ForegroundColor Yellow
+            }
+            elseif ($errorMsg -match "network" -or $errorMsg -match "subnet") {
+                Write-Host "❌ 可用域$AD：网络/子网配置异常" -ForegroundColor Red
+            }
+            elseif ($errorMsg -match "SSH" -or $errorMsg -match "key") {
+                Write-Host "❌ 可用域$AD：SSH密钥未配置，请检查控制台公钥" -ForegroundColor Red
+            }
+            else {
+                $showMsg = $errorMsg.Substring(0, [Math]::Min(80, $errorMsg.Length))
+                Write-Host "❌ 可用域$AD：创建失败 → $showMsg" -ForegroundColor Red
+            }
+            continue
+        }
+    }
+
+    # 本轮所有AD都失败 → 30分钟后重试
+    if (-not $success -and $allADFailed) {
+        Write-Host "`n❌ 本轮所有可用域都无资源/创建失败" -ForegroundColor Red
+        Write-Host "⏳ 下一轮重试时间：$nextRetryTime" -ForegroundColor Cyan
+        Show-PreciseCountdown -TotalSeconds $RETRY_WAIT_SECONDS -NextRetryTime $nextRetryTime
+    }
+}
+
+Write-Host "`n✅ 脚本执行完成！" -ForegroundColor Green
+Read-Host "按任意键退出..."
