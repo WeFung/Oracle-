@@ -13,7 +13,7 @@
 
 ②、在控制台-网络-创建VCN，名称随便填，主要是复制VCN的UCID
 
-以上的到信息要在脚本的命令里填写
+以上的信息要在脚本的命令里填写
 
 ![immwrt界面](https://github.com/user-attachments/assets/c196f381-65d0-45cd-b5d5-0cd3caf6696d）
 
