@@ -31,7 +31,7 @@
 
 📌 配置步骤2：点击「添加API密钥」→ 选择「粘贴公共密钥」→ 复制下方公钥粘贴
 
-
+![immwrt界面](https://github.com/user-attachments/assets/08f716b1-b39c-49b8-8628-e1d7143cea61)
 
 
 📌 配置步骤3：点击「添加」，配置完成后回到本窗口按【回车】继续
