@@ -1,0 +1,297 @@
+#!/bin/bash
+# 甲骨文OCI实例创建脚本（Mac适配版）
+# 终极适配版：芝加哥免费区 | 仅ARM架构免费 | 3可用域全量尝试后再等待
+# 核心规则：先遍历AD1/AD2/AD3所有可用域 → 全部失败后隔30分钟重试 | 密钥永久复用
+# 系统镜像：Ubuntu 24.04 Minimal ARM（官方适配免费区）
+# 配置规格：VM.Standard.A1.Flex 1OCPU+6G内存（免费配额拉满）
+# 用户信息：个人注册邮箱 | ocid1.user.oc1..***********
+# 需填配置：SUBNET_OCID / TENANT_OCID（无需修改）
+# 本地适配：Mac默认用户目录 ~/.oci
+
+
+# ===================================== 基础环境初始化 =====================================
+# 检查是否为bash环境
+if [ -z "$BASH_VERSION" ]; then
+    echo -e "\033[31m❌ 请使用bash执行此脚本（Mac默认终端为zsh，需切换：exec bash）\033[0m"
+    exit 1
+fi
+
+# 检查是否为管理员权限
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "\033[31m❌ 请使用sudo执行此脚本（sudo bash ./脚本名称.sh）\033[0m"
+    exit 1
+fi
+
+
+# ===================================== 前置工具检查 =====================================
+# 检查OpenSSL、ssh-keygen、curl
+REQUIRED_TOOLS=("openssl" "ssh-keygen" "curl" "python3")
+for tool in "${REQUIRED_TOOLS[@]}"; do
+    if ! command -v $tool &> /dev/null; then
+        echo -e "\033[31m❌ 未检测到工具：$tool\033[0m"
+        if [ "$tool" = "python3" ]; then
+            echo -e "\033[33m📌 请先安装Python3：brew install python3\033[0m"
+        else
+            echo -e "\033[33m📌 请先安装：brew install $tool\033[0m"
+        fi
+        exit 1
+    fi
+done
+
+
+# ===================================== 核心配置（需填写，要修改） =====================================
+SUBNET_OCID="ocid1.subnet.oc1.主区域.**********"
+TENANT_OCID="ocid1.tenancy.oc1..**********"
+USER_OCID="ocid1.user.oc1..*********"
+REGION="主区域"
+INSTANCE_NAME="OCI-Chicago-ARM-Ubuntu2404"
+SHAPE="VM.Standard.A1.Flex"
+OCPU_COUNT=1
+MEMORY_IN_GBS=6
+RETRY_WAIT_SEC=1800  # 30分钟
+AVAILABILITY_DOMAINS=("Gviv:主区域-AD-1" "Gviv:主区域-AD-2" "Gviv:主区域-1-AD-3")
+
+# Mac本地密钥/配置目录（~/.oci为OCI默认目录）
+OCI_BASE_DIR="$HOME/.oci"
+SSH_KEY_PATH="$OCI_BASE_DIR/oci_ssh_key"
+API_KEY_PATH="$OCI_BASE_DIR/oci_api_key"
+
+
+# ===================================== 预创建目录 & 权限配置 =====================================
+# 创建.oci目录
+if [ ! -d "$OCI_BASE_DIR" ]; then
+    mkdir -p "$OCI_BASE_DIR"
+    chmod 700 "$OCI_BASE_DIR"  # OCI要求密钥目录权限为700
+    echo -e "\033[32m✅ 预创建密钥配置目录成功：$OCI_BASE_DIR\033[0m"
+fi
+
+
+# ===================================== 安装OCI CLI（Mac适配） =====================================
+echo -e "\n\033[32m===================== 检测OCI CLI运行环境 ======================\033[0m"
+if ! command -v oci &> /dev/null; then
+    echo -e "\033[33m⚠️ 未检测到OCI CLI，开始安装...\033[0m"
+    # 使用Mac官方推荐的pip安装（已装Python3）
+    pip3 install oci-cli --user
+    # 将OCI CLI添加到环境变量（Mac用户目录）
+    echo 'export PATH="$HOME/Library/Python/3.*/bin:$PATH"' >> ~/.bash_profile
+    source ~/.bash_profile
+    if command -v oci &> /dev/null; then
+        echo -e "\033[32m✅ OCI CLI安装成功\033[0m"
+    else
+        echo -e "\033[31m❌ OCI CLI安装失败，请手动执行：pip3 install oci-cli --user\033[0m"
+        exit 1
+    fi
+else
+    echo -e "\033[32m✅ 检测到OCI CLI已安装，直接跳过\033[0m"
+fi
+
+
+# ===================================== 生成SSH登录密钥（Mac适配） =====================================
+echo -e "\n\033[32m===================== 生成/复用SSH登录密钥 ======================\033[0m"
+if [ ! -f "$SSH_KEY_PATH.pub" ]; then
+    ssh-keygen -t rsa -b 2048 -N "" -f "$SSH_KEY_PATH" &> /dev/null
+    chmod 600 "$SSH_KEY_PATH"  # Mac密钥权限要求
+    if [ -f "$SSH_KEY_PATH.pub" ]; then
+        echo -e "\033[32m✅ SSH密钥对生成成功：$SSH_KEY_PATH\033[0m"
+    else
+        echo -e "\033[31m❌ SSH密钥生成失败\033[0m"
+        exit 1
+    fi
+else
+    echo -e "\033[33m⚠️ 检测到SSH密钥已存在，直接复用\033[0m"
+fi
+SSH_PUB_KEY=$(cat "$SSH_KEY_PATH.pub")
+
+
+# ===================================== 生成API认证密钥（Mac适配） =====================================
+echo -e "\n\033[32m===================== 生成/复用API认证密钥 ======================\033[0m"
+if [ ! -f "$API_KEY_PATH.pem" ]; then
+    openssl genrsa -out "$API_KEY_PATH.pem" 2048 &> /dev/null
+    openssl rsa -pubout -in "$API_KEY_PATH.pem" -out "$API_KEY_PATH_public.pem" &> /dev/null
+    chmod 600 "$API_KEY_PATH.pem"  # OCI要求API私钥权限为600
+    if [ -f "$API_KEY_PATH_public.pem" ]; then
+        echo -e "\033[32m✅ API密钥对生成成功：$API_KEY_PATH.pem\033[0m"
+    else
+        echo -e "\033[31m❌ API密钥生成失败\033[0m"
+        exit 1
+    fi
+else
+    echo -e "\033[33m⚠️ 检测到API密钥已存在，直接复用\033[0m"
+fi
+# 计算API指纹（Mac适配）
+API_FINGERPRINT=$(openssl rsa -pubout -in "$API_KEY_PATH.pem" -outform DER 2> /dev/null | openssl md5 -c | sed 's/MD5(\)= //g' | sed 's/://g' | tr -d ' ')
+
+
+# ===================================== 生成OCI CLI配置文件 =====================================
+echo -e "\n\033[32m===================== 生成OCI CLI配置文件 ======================\033[0m"
+cat > "$OCI_BASE_DIR/config" << EOF
+[DEFAULT]
+user=$USER_OCID
+tenancy=$TENANT_OCID
+region=$REGION
+fingerprint=$API_FINGERPRINT
+key_file=$API_KEY_PATH.pem
+pass_phrase=
+profile=DEFAULT
+EOF
+chmod 600 "$OCI_BASE_DIR/config"  # OCI配置文件权限要求
+echo -e "\033[32m✅ OCI配置文件生成完成：$OCI_BASE_DIR/config\033[0m"
+
+
+# ===================================== 暂停等待配置API密钥 =====================================
+echo -e "\n\033[31m===================== 【重要】配置甲骨文API密钥 ======================\033[0m"
+echo -e "\033[33m📌 配置步骤1：打开甲骨文控制台 → 右上角头像 → 我的个人资料 → API密钥\033[0m"
+echo -e "\033[33m📌 配置步骤2：点击「添加API密钥」→ 选择「粘贴公共密钥」→ 复制下方公钥粘贴\033[0m"
+echo -e "\033[33m📌 配置步骤3：点击「添加」，配置完成后按【回车】继续\033[0m"
+echo -e "--------------------------------------------------------"
+cat "$API_KEY_PATH_public.pem"
+echo -e "--------------------------------------------------------"
+read -p ""
+
+
+# ===================================== 获取Ubuntu 24.04 ARM镜像ID =====================================
+echo -e "\n\033[32m===================== 获取Ubuntu 24.04 ARM镜像ID ======================\033[0m"
+IMAGE_ID=$(oci compute image list --compartment-id "$TENANT_OCID" --region "$REGION" \
+    --filter "display-name eq 'Canonical-Ubuntu-24.04-Minimal-ARM-2024.10.01-0'" --query "data[0].id" --output json 2> /dev/null | python3 -c "import json, sys; print(json.load(sys.stdin))")
+
+if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "None" ]; then
+    # 备用镜像ID（兜底）
+    IMAGE_ID="ocid1.image.oc1.主区域.***********" #主区域修改和*修改为UCID
+    echo -e "\033[33m⚠️ 动态获取镜像失败，使用备用ARM镜像ID：$IMAGE_ID\033[0m"
+else
+    echo -e "\033[32m✅ 动态获取官方ARM镜像ID成功：$IMAGE_ID\033[0m"
+fi
+
+
+# ===================================== 解析失败原因函数 =====================================
+get_failure_reason() {
+    local error_msg="$1"
+    if echo "$error_msg" | grep -q "Out of host capacity\|Capacity unavailable"; then
+        echo "无资源（该可用域ARM实例配额已耗尽）"
+    elif echo "$error_msg" | grep -q "Quota exceeded\|quota"; then
+        echo "配额不足（账号免费配额已用完/旧实例未清理）"
+    elif echo "$error_msg" | grep -q "Network\|Connection refused\|Timeout"; then
+        echo "网络原因（本地网络/OCI服务网络不通）"
+    elif echo "$error_msg" | grep -q "Fingerprint\|API key\|Authentication"; then
+        echo "API密钥认证失败（控制台密钥未配置/指纹不匹配）"
+    elif echo "$error_msg" | grep -q "Image\|sourceDetails"; then
+        echo "镜像ID无效（官方镜像更新/备用ID失效）"
+    elif echo "$error_msg" | grep -q "Subnet\|availability domain"; then
+        echo "子网/可用域配置错误（区域不匹配）"
+    else
+        echo "未知错误（请检查OCI控制台状态/脚本配置）"
+    fi
+}
+
+
+# ===================================== 精准倒计时函数 =====================================
+show_countdown() {
+    local seconds="$1"
+    local end_time=$(( $(date +%s) + seconds ))
+    while [ $(date +%s) -lt $end_time ]; do
+        local remaining=$(( end_time - $(date +%s) ))
+        local minutes=$(( remaining / 60 ))
+        local secs=$(( remaining % 60 ))
+        echo -ne "\r\033[36m⏳ 等待重试中：剩余 $minutes 分 $secs 秒（总计30分钟）\033[0m"
+        sleep 1
+    done
+    echo -e "\n\033[32m✅ 等待结束，开始新一轮可用域遍历！\n\033[0m"
+}
+
+
+# ===================================== 核心创建逻辑（遍历所有可用域后等待） =====================================
+echo -e "\n\033[32m===================== 开始创建ARM架构免费实例 ======================\033[0m"
+echo -e "\033[36m📌 实例配置：$SHAPE | $OCPU_COUNT OCPU + $MEMORY_IN_GBS G内存（免费配额拉满）\033[0m"
+echo -e "\033[36m📌 重试规则：先遍历AD1/AD2/AD3所有可用域 → 全部失败后等待30分钟重试\033[0m"
+echo -e "\033[36m📌 停止方式：直接关闭终端窗口，即可终止重试流程\033[0m"
+
+retry_round=0
+instance_created=0
+instance_id=""
+
+while [ $instance_created -eq 0 ]; do
+    retry_round=$((retry_round + 1))
+    current_time=$(date +"%Y-%m-%d %H:%M:%S")
+    round_success=0
+
+    echo -e "\n============================================================"
+    echo -e "\033[37m[$current_time] 开始第$retry_round轮尝试 | 即将遍历所有3个可用域\033[0m"
+    echo -e "============================================================"
+
+    # 遍历所有可用域（AD1/AD2/AD3）
+    for current_ad in "${AVAILABILITY_DOMAINS[@]}"; do
+        domain_name=$(echo "$current_ad" | awk -F'-' '{print $NF}')  # 提取AD1/AD2/AD3
+        echo -e "\n\033[37m[$current_time] 尝试可用域 $domain_name ($current_ad)...\033[0m"
+
+        # 执行实例创建命令
+        create_output=$(oci compute instance launch \
+            --compartment-id "$TENANT_OCID" \
+            --display-name "$INSTANCE_NAME" \
+            --shape "$SHAPE" \
+            --shape-config "{\"ocpus\": $OCPU_COUNT, \"memoryInGBs\": $MEMORY_IN_GBS}" \
+            --availability-domain "$current_ad" \
+            --subnet-id "$SUBNET_OCID" \
+            --ssh-authorized-keys "$SSH_PUB_KEY" \
+            --source-details "{\"sourceType\": \"image\", \"imageId\": \"$IMAGE_ID\"}" \
+            --assign-public-ip true \
+            --wait-for-state RUNNING \
+            --region "$REGION" \
+            --force \
+            --output json 2>&1)
+        
+        # 检查退出码
+        if [ $? -eq 0 ]; then
+            instance_id=$(echo "$create_output" | python3 -c "import json, sys; print(json.load(sys.stdin)['data']['id'])")
+            echo -e "\033[32m[$current_time] 可用域 $domain_name 创建成功！本轮尝试完成\033[0m"
+            instance_created=1
+            round_success=1
+            break
+        else
+            # 解析失败原因
+            failure_reason=$(get_failure_reason "$create_output")
+            # 截断过长错误信息
+            truncated_error=$(echo "$create_output" | head -n 1 | cut -c 1-150)
+            echo -e "\033[31m[$current_time] 可用域 $domain_name 创建失败 | 原因：$failure_reason\033[0m"
+            echo -e "\033[35m[$current_time] 原始错误（截断）：$truncated_error...\033[0m"
+        fi
+    done
+
+    # 本轮成功则跳出循环
+    if [ $round_success -eq 1 ]; then
+        break
+    fi
+
+    # 本轮失败 → 等待30分钟
+    current_time=$(date +"%Y-%m-%d %H:%M:%S")
+    echo -e "\n\033[31m[$current_time] 第$retry_round轮所有可用域尝试失败\033[0m"
+    echo -e "\033[33m[$current_time] 即将等待30分钟（1800秒）后开始下一轮尝试\033[0m"
+    echo -e "\033[33m[$current_time] 如需终止重试，直接关闭终端窗口即可\033[0m"
+    show_countdown $RETRY_WAIT_SEC
+done
+
+
+# ===================================== 实例创建成功 - 结果汇总 =====================================
+public_ip=""
+if [ $instance_created -eq 1 ]; then
+    public_ip=$(oci compute instance list-vnics --instance-id "$instance_id" --region "$REGION" \
+        --query "data[0].\"public-ip\"" --output json 2> /dev/null | python3 -c "import json, sys; print(json.load(sys.stdin))")
+fi
+
+echo -e "\n============================================================"
+echo -e "\033[32m===================== 🎉 ARM实例创建成功！🎉 ======================\033[0m"
+echo -e "🔹 实例名称：$INSTANCE_NAME"
+echo -e "🔹 所在区域：芝加哥（$REGION）"
+echo -e "🔹 重试轮次：$retry_round轮（每轮遍历3个可用域）"
+echo -e "🔹 实例OCID：$instance_id"
+if [ -n "$public_ip" ] && [ "$public_ip" != "None" ]; then
+    echo -e "\033[36m🔹 公网IP：$public_ip\033[0m"
+    echo -e "\033[36m🔹 SSH登录命令：ssh ubuntu@$public_ip -i $SSH_KEY_PATH\033[0m"
+else
+    echo -e "\033[33m⚠️ 公网IP自动获取失败，可前往甲骨文控制台查看实例详情\033[0m"
+fi
+echo -e "\033[33m🔹 登录用户名：ubuntu（OCI禁止root直接登录，ARM Ubuntu专用）\033[0m"
+echo -e "\033[33m🔹 密钥路径：$SSH_KEY_PATH（请勿删除，后续登录实例必需）\033[0m"
+echo -e "============================================================"
+
+# 等待用户确认
+read -p "`echo -e '\n实例创建成功，按任意键关闭终端...'`"
