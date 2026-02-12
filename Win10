@@ -4,7 +4,7 @@
 核心规则：30分钟（1800秒）重试一次 | 密钥永久复用 | 跳过重复安装 | 无限重试至手动关闭
 系统镜像：Ubuntu 24.04 Minimal ARM（官方适配免费区）
 配置规格：VM.Standard.A1.Flex 1OCPU+6G内存（免费配额拉满）
-需要配置：$SUBNET_OCID / $TENANT_OCID（需修改）
+需要配置：$SUBNET_OCID / $TENANT_OCID / $AVAILABILITY_DOMAINS（需修改）
 本地适配：用户名 | 密钥目录C:\Users\Administrator\.oci
 #>
 
