@@ -16,7 +16,7 @@
 
 
 
-①、登录oracle账号，点击右上角账号信息，把用户名（注册的邮箱）、用户名的OCID（SUBNET_OCID）和详细信息的OCID（TENANT_OCID），两者不一样、主区域（REGION）、DOMAIN
+①、登录oracle账号，点击右上角账号信息，把用户名（注册的邮箱）、用户名的OCID（SUBNET_OCID）和详细信息的OCID（TENANT_OCID），两者不一样、主区域（REGION）、AVAILABILITY_DOMAINS;
 
 ![immwrt界面](https://github.com/user-attachments/assets/c196f381-65d0-45cd-b5d5-0cd3caf6696d)
 
