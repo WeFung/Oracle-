@@ -9,7 +9,7 @@ $COMPARTMENT_ID = "ocid1.tenancy.oc1..*****************" # Compartment默认和�
 $API_FINGERPRINT = "****************************"
 # =================================================
 
-# 固定配置
+# 选定配置
 $REGION = "us-chicago-1" #你的主区域
 $AVAILABILITY_DOMAINS = @("Gviv:US-CHICAGO-1-AD-2", "Gviv:US-CHICAGO-1-AD-3", "Gviv:US-CHICAGO-1-AD-1")
 $SSH_KEY_PATH = "C:\Users\$env:USERNAME\.oci\oci_ssh_key"
