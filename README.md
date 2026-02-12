@@ -8,7 +8,11 @@
 ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥  ♥ ♥ 
 
 ！！！！前提准备工作：
+
 ①、登录oracle账号，点击右上角账号信息，把用户名（注册的邮箱）、用户名的OCID（SUBNET_OCID）和详细信息的OCID（TENANT_OCID），两者不一样，主区域（REGION）
+
+![immwrt界面](https://github.com/user-attachments/assets/c196f381-65d0-45cd-b5d5-0cd3caf6696d)
+
 
 ![immwrt界面](https://github.com/user-attachments/assets/8af586d5-fbab-49cc-a752-fe1e04eff34c)
 
@@ -21,10 +25,6 @@
 
 
 ！！！以上的信息要打开脚本，以文档txt或者其他工具编译，然后把里面的信息填写到相应的位置上
-
-
-![immwrt界面](https://github.com/user-attachments/assets/c196f381-65d0-45cd-b5d5-0cd3caf6696d)
-
 
 
 ......................................................................................................................
